@@ -16,11 +16,13 @@ window closed, terminal quit, machine reboot) stay and show up here.
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
@@ -29,7 +31,37 @@ SETTINGS = CONFIG / "settings.json"
 DELIBERATE_END = {"prompt_input_exit", "logout", "clear"}
 HOOK_EVENTS = ("SessionStart", "SessionEnd")
 SHIM_DIR = CONFIG / "cc-restore" / "bin"
+HOOK_LOG = CONFIG / "cc-restore" / "hook.log"
 DEFAULT_DAYS = 7
+# Claude Code session ids are UUIDs. Anything else is refused before it can
+# become a file name under LIVE or an argument to `claude --resume`.
+SESSION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def valid_sid(sid):
+    return isinstance(sid, str) and bool(SESSION_ID.match(sid))
+
+
+def valid_cwd(cwd):
+    return isinstance(cwd, str) and os.path.isabs(cwd) and "\0" not in cwd
+
+
+def valid_transcript(tp):
+    """Transcripts live under <config>/projects/; the registry must not make us
+    read anything else."""
+    if not isinstance(tp, str) or "\0" in tp:
+        return False
+    try:
+        Path(tp).resolve().relative_to((CONFIG / "projects").resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def printable(s):
+    """Drop control characters (ANSI escapes, newlines, ...) so transcript text
+    cannot steer the terminal it is printed to."""
+    return "".join(c for c in s if unicodedata.category(c) not in ("Cc", "Cf"))
 
 
 # ---------------------------------------------------------------- processes
@@ -70,6 +102,14 @@ def alive_claude(pid):
 # ---------------------------------------------------------------- registry
 
 def write_entry(sid, cwd, transcript, pid, source):
+    if not valid_sid(sid):
+        raise ValueError(f"refusing session id {sid!r}")
+    if not valid_cwd(cwd):
+        raise ValueError(f"refusing cwd {cwd!r}")
+    if transcript is not None and not valid_transcript(transcript):
+        raise ValueError(f"refusing transcript path {transcript!r}")
+    if not isinstance(pid, int) or pid <= 1:
+        raise ValueError(f"refusing pid {pid!r}")
     LIVE.mkdir(parents=True, exist_ok=True)
     entry = {"session_id": sid, "cwd": cwd, "transcript_path": transcript,
              "pid": pid, "source": source, "updated_at": time.time()}
@@ -80,7 +120,7 @@ def cmd_hook():
     try:
         data = json.load(sys.stdin)
         sid = data.get("session_id")
-        if not sid:
+        if not valid_sid(sid):
             return
         path = LIVE / f"{sid}.json"
         event = data.get("hook_event_name")
@@ -101,8 +141,14 @@ def cmd_hook():
         if data.get("source") == "startup":
             link_shell_command()
             notify_restorable()
-    except Exception:
-        pass  # a registry hiccup must never disturb the session
+    except Exception as err:
+        # a registry hiccup must never disturb the session, but leave a trace
+        try:
+            HOOK_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(HOOK_LOG, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {type(err).__name__}: {err}\n")
+        except OSError:
+            pass
 
 
 def plugin_root():
@@ -136,10 +182,9 @@ def notify_restorable():
             {k: v for k, v in e.items() if not k.startswith("_") and k != "mtime"},
             ensure_ascii=False))
     n = len(entries)
-    how = "/cc-restore:restore" if plugin_root() else "cc-restore"
     print(json.dumps({"systemMessage":
         f"cc-restore: {n} Claude Code session{'s' if n > 1 else ''} closed with "
-        f"the terminal. Run {how} to reopen them."}))
+        f"the terminal. Run cc-restore in a shell to reopen them."}))
 
 
 def seed_running():
@@ -152,6 +197,8 @@ def seed_running():
             continue
         pid, sid, cwd = s.get("pid"), s.get("sessionId"), s.get("cwd")
         if s.get("kind") != "interactive" or not (pid and sid and cwd):
+            continue
+        if not (valid_sid(sid) and valid_cwd(cwd) and isinstance(pid, int)):
             continue
         if not alive_claude(pid):
             continue
@@ -189,7 +236,7 @@ def title_of(transcript):
                         first = c
     except OSError:
         return "(untitled)"
-    return " ".join((custom or ai or first or "(untitled)").split())[:70]
+    return " ".join(printable(custom or ai or first or "(untitled)").split())[:70]
 
 
 def load(days, titles=True):
@@ -200,10 +247,19 @@ def load(days, titles=True):
         except ValueError:
             p.unlink(missing_ok=True)
             continue
+        if not (isinstance(e, dict) and valid_sid(e.get("session_id"))
+                and p.stem == e["session_id"] and valid_cwd(e.get("cwd"))
+                and isinstance(e.get("pid"), int)
+                and isinstance(e.get("updated_at"), (int, float))):
+            p.unlink(missing_ok=True)  # not something this tool wrote
+            continue
         tp = e.get("transcript_path")
+        if tp is not None and not valid_transcript(tp):
+            p.unlink(missing_ok=True)
+            continue
         if not tp or not os.path.exists(tp):
             # no message yet: drop it once the process is gone, nothing to resume
-            if not alive_claude(e.get("pid", 0)):
+            if not alive_claude(e["pid"]):
                 p.unlink(missing_ok=True)
             continue
         e["_path"], e["mtime"] = p, os.path.getmtime(tp)
@@ -281,7 +337,7 @@ def open_iterm(entries):
 def open_tmux(entries):
     for e in entries:
         subprocess.run(["tmux", "new-window", "-c", e["cwd"],
-                        "-n", e["title"][:20], resume_cmd(e)], check=True)
+                        "-n", e["title"][:20] or "claude", resume_cmd(e)], check=True)
 
 
 def open_print(entries):
