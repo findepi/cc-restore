@@ -7,18 +7,19 @@ conversation intact.
 ```
 $ claude
   ⎿  cc-restore: 3 Claude Code sessions closed with the terminal.
-     Run /cc-restore:restore to reopen them.
+     Run cc-restore in a shell to reopen them.
 
-> /cc-restore:restore
+$ cc-restore
   1  10-08 16:24  ~/work/api       Fix flaky integration test
   2  10-08 15:51  ~/work/web       Migrate settings page to new form lib
   3  10-08 11:02  ~                Weekly report draft
 
-  Reopen all of them, or pick some (e.g. 1 3, or -2 for all but #2)?
-
-> all
-  Reopened 3 session(s).
+Enter = all | 1 3 = only these | -2 4 = all but these (and forget them) | q = quit:
+Reopened 3 session(s).
 ```
+
+Restoring is a shell command on purpose: no model reads the session list or decides
+what to run. See [Security](#security).
 
 ## Why not just `claude --resume`?
 
@@ -67,8 +68,8 @@ The hooks ship with the plugin; your settings files are not touched. Sessions yo
 start from now on are tracked. Sessions that were already open when you installed
 are tracked from the next time they start.
 
-To also run `cc-restore` from a shell, put the link the plugin keeps up to date on
-your `PATH`:
+Restoring happens from a shell, so put the link the plugin keeps up to date on your
+`PATH`:
 
 ```sh
 export PATH="$HOME/.claude/cc-restore/bin:$PATH"
@@ -90,21 +91,13 @@ Use one install method, not both. `CLAUDE_CONFIG_DIR` is respected either way.
 
 ## Usage
 
-Inside Claude Code:
-
-```
-/cc-restore:restore          # show the list, then ask which to reopen
-/cc-restore:restore all      # reopen everything
-/cc-restore:restore 1 3      # only #1 and #3; the rest stay listed
-/cc-restore:restore -2       # everything except #2, and forget #2
-```
-
-From a shell:
+From a shell (not from inside Claude Code — see [Security](#security)):
 
 ```sh
-cc-restore                   # show the list, then ask
+cc-restore                   # show the list, then ask which to reopen
 cc-restore --all             # reopen everything
-cc-restore --pick "1 3"      # same choices as above, without the prompt
+cc-restore --pick "1 3"      # only #1 and #3; the rest stay listed
+cc-restore --pick "-2"       # everything except #2, and forget #2
 cc-restore --list            # just show the list
 cc-restore --days 30         # look back further (default: 7 days)
 cc-restore --terminal tmux   # override terminal detection
@@ -139,6 +132,25 @@ respond, cc-restore stops after 30 seconds and leaves the list as it was.
   scrollback. The conversation itself is fully restored.
 - **Skipped automatically:** headless runs (`claude -p`), and sessions that never got
   a message (there is nothing to resume).
+
+## Security
+
+- **No model in the loop.** Earlier versions shipped a `/cc-restore:restore` slash
+  command that fed the session list — titles taken from your transcripts — into
+  Claude and let it pick what to reopen. That is a prompt-injection path, however
+  narrow, so it is gone: the list is only ever shown to you, in a shell, and only you
+  choose.
+- **No network.** Standard library only; the only programs it runs are `ps`,
+  `osascript` (macOS) and `tmux`, always with argument lists, never through a shell.
+- **Fail-fast on odd input.** Session ids must be UUIDs before they become file names
+  or `claude --resume` arguments; working directories must be absolute paths;
+  transcript paths must lie under `~/.claude/projects/`. Registry records that do not
+  pass are deleted, not used.
+- **Terminal-safe output.** Titles are stripped of control characters, so a transcript
+  cannot smuggle escape sequences into your terminal.
+- **Hook failures are logged**, not swallowed: `~/.claude/cc-restore/hook.log`.
+- **Install from a repository you control.** `/plugin marketplace add` keeps updating
+  from wherever you added it.
 
 ## Uninstall
 
