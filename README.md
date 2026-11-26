@@ -59,7 +59,7 @@ Requires Python 3.8+ (standard library only) and macOS or Linux.
 In Claude Code:
 
 ```
-/plugin marketplace add SnowWarri0r/cc-restore
+/plugin marketplace add findepi/cc-restore
 /plugin install cc-restore@cc-restore
 ```
 
@@ -77,7 +77,7 @@ export PATH="$HOME/.claude/cc-restore/bin:$PATH"
 ### Standalone
 
 ```sh
-git clone https://github.com/SnowWarri0r/cc-restore.git ~/cc-restore
+git clone https://github.com/findepi/cc-restore.git ~/cc-restore
 ln -s ~/cc-restore/bin/cc-restore ~/.local/bin/cc-restore   # any directory on your PATH
 cc-restore install
 ```
