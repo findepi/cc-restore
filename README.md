@@ -39,12 +39,13 @@ last month, use `--resume`.
 ## How it works
 
 - A `SessionStart` hook records every interactive session — id, working directory,
-  transcript path, process id — in `~/.claude/cc-restore/live/`.
+  transcript path, process id and start time — in `~/.claude/cc-restore/live/`.
 - A `SessionEnd` hook removes the record when you leave on purpose: `/exit`, Ctrl-D,
   double Ctrl-C, `/clear`.
 - A session that dies with its terminal — tab or window closed, terminal quit,
   machine rebooted — keeps its record.
-- Restoring lists the records whose process is gone and reopens the ones you pick
+- Restoring lists the records whose process is gone (same pid and start time, so a
+  pid reused after a reboot does not count as alive) and reopens the ones you pick
   with `claude --resume <id>`. A reopened session keeps its id and records itself
   again, so the cycle repeats.
 
@@ -140,15 +141,18 @@ respond, cc-restore stops after 30 seconds and leaves the list as it was.
   Claude and let it pick what to reopen. That is a prompt-injection path, however
   narrow, so it is gone: the list is only ever shown to you, in a shell, and only you
   choose.
-- **No network.** Standard library only; the only programs it runs are `ps`,
-  `osascript` (macOS) and `tmux`, always with argument lists, never through a shell.
+- **No network.** Standard library only. It runs `ps`, `osascript` (macOS) and `tmux`
+  with argument lists; the only thing that reaches a shell is the
+  `claude --resume <id>` line typed into each new tab, with the id validated and quoted.
 - **Fail-fast on odd input.** Session ids must be UUIDs before they become file names
-  or `claude --resume` arguments; working directories must be absolute paths;
-  transcript paths must lie under `~/.claude/projects/`. Registry records that do not
-  pass are deleted, not used.
-- **Terminal-safe output.** Titles are stripped of control characters, so a transcript
-  cannot smuggle escape sequences into your terminal.
-- **Hook failures are logged**, not swallowed: `~/.claude/cc-restore/hook.log`.
+  or `claude --resume` arguments; working directories must be absolute paths without
+  control characters; transcript paths must be absolute and lie under
+  `<config dir>/projects/`. Registry records that do not pass are deleted, not used —
+  the one exception to "only sessions you exclude leave the list".
+- **Terminal-safe output.** Titles are stripped of control characters and directories
+  containing them are refused, so nothing from a transcript or record can smuggle
+  escape sequences into your terminal.
+- **Hook problems are logged**, not swallowed: `<config dir>/cc-restore/hook.log`.
 - **Install from a repository you control.** `/plugin marketplace add` keeps updating
   from wherever you added it.
 

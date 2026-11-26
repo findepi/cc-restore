@@ -35,21 +35,32 @@ HOOK_LOG = CONFIG / "cc-restore" / "hook.log"
 DEFAULT_DAYS = 7
 # Claude Code session ids are UUIDs. Anything else is refused before it can
 # become a file name under LIVE or an argument to `claude --resume`.
-SESSION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def is_printable(s):
+    return all(unicodedata.category(c) not in ("Cc", "Cf") for c in s)
+
+
+def printable(s):
+    """Drop control characters (ANSI escapes, newlines, ...) so transcript text
+    cannot steer the terminal it is printed to."""
+    return "".join(c for c in s if unicodedata.category(c) not in ("Cc", "Cf"))
 
 
 def valid_sid(sid):
-    return isinstance(sid, str) and bool(SESSION_ID.match(sid))
+    return isinstance(sid, str) and SESSION_ID.fullmatch(sid) is not None
 
 
 def valid_cwd(cwd):
-    return isinstance(cwd, str) and os.path.isabs(cwd) and "\0" not in cwd
+    # printed to the terminal as-is, so control characters are refused outright
+    return isinstance(cwd, str) and os.path.isabs(cwd) and is_printable(cwd)
 
 
 def valid_transcript(tp):
     """Transcripts live under <config>/projects/; the registry must not make us
     read anything else."""
-    if not isinstance(tp, str) or "\0" in tp:
+    if not isinstance(tp, str) or not os.path.isabs(tp) or "\0" in tp:
         return False
     try:
         Path(tp).resolve().relative_to((CONFIG / "projects").resolve())
@@ -58,10 +69,14 @@ def valid_transcript(tp):
     return True
 
 
-def printable(s):
-    """Drop control characters (ANSI escapes, newlines, ...) so transcript text
-    cannot steer the terminal it is printed to."""
-    return "".join(c for c in s if unicodedata.category(c) not in ("Cc", "Cf"))
+def log(msg):
+    """Hooks must never disturb the session, so problems go to a file."""
+    try:
+        HOOK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(HOOK_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- processes
@@ -89,14 +104,22 @@ def claude_ancestor():
     return None
 
 
-def alive_claude(pid):
+def started_at(pid):
+    return ps(pid, "lstart")
+
+
+def alive_claude(pid, started=None):
+    """Is `pid` still the claude process it was recorded as? After a reboot pids
+    are reused, so a recorded start time is compared as well when present."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         pass
-    return is_claude(pid)
+    if not is_claude(pid):
+        return False
+    return started is None or started_at(pid) == started
 
 
 # ---------------------------------------------------------------- registry
@@ -108,11 +131,10 @@ def write_entry(sid, cwd, transcript, pid, source):
         raise ValueError(f"refusing cwd {cwd!r}")
     if transcript is not None and not valid_transcript(transcript):
         raise ValueError(f"refusing transcript path {transcript!r}")
-    if not isinstance(pid, int) or pid <= 1:
-        raise ValueError(f"refusing pid {pid!r}")
     LIVE.mkdir(parents=True, exist_ok=True)
     entry = {"session_id": sid, "cwd": cwd, "transcript_path": transcript,
-             "pid": pid, "source": source, "updated_at": time.time()}
+             "pid": pid, "started": started_at(pid), "source": source,
+             "updated_at": time.time()}
     (LIVE / f"{sid}.json").write_text(json.dumps(entry, ensure_ascii=False))
 
 
@@ -121,7 +143,7 @@ def cmd_hook():
         data = json.load(sys.stdin)
         sid = data.get("session_id")
         if not valid_sid(sid):
-            return
+            return log(f"refusing session id {sid!r}")
         path = LIVE / f"{sid}.json"
         event = data.get("hook_event_name")
         if event == "SessionEnd":
@@ -132,23 +154,20 @@ def cmd_hook():
             return
         pid = claude_ancestor()
         if pid is None:
-            return
+            return log("no claude process among the hook's ancestors")
         args = ps(pid, "args").split()
         if "-p" in args or "--print" in args:  # headless runs have no tab
             return
-        write_entry(sid, data.get("cwd") or os.getcwd(),
-                    data.get("transcript_path"), pid, data.get("source"))
+        try:
+            write_entry(sid, data.get("cwd") or os.getcwd(),
+                        data.get("transcript_path"), pid, data.get("source"))
+        except ValueError as err:
+            log(str(err))  # this session is not tracked; the rest still applies
         if data.get("source") == "startup":
             link_shell_command()
             notify_restorable()
     except Exception as err:
-        # a registry hiccup must never disturb the session, but leave a trace
-        try:
-            HOOK_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with open(HOOK_LOG, "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {type(err).__name__}: {err}\n")
-        except OSError:
-            pass
+        log(f"{type(err).__name__}: {err}")
 
 
 def plugin_root():
@@ -195,10 +214,10 @@ def seed_running():
             s = json.loads(f.read_text())
         except ValueError:
             continue
-        pid, sid, cwd = s.get("pid"), s.get("sessionId"), s.get("cwd")
-        if s.get("kind") != "interactive" or not (pid and sid and cwd):
+        if s.get("kind") != "interactive":
             continue
-        if not (valid_sid(sid) and valid_cwd(cwd) and isinstance(pid, int)):
+        pid, sid, cwd = s.get("pid"), s.get("sessionId"), s.get("cwd")
+        if not (valid_sid(sid) and valid_cwd(cwd) and type(pid) is int):
             continue
         if not alive_claude(pid):
             continue
@@ -224,19 +243,26 @@ def title_of(transcript):
                     continue
                 t = rec.get("type")
                 if t == "custom-title":
-                    custom = rec.get("customTitle") or rec.get("title") or custom
+                    custom = text_of(rec.get("customTitle")) or text_of(rec.get("title")) or custom
                 elif t == "ai-title":
-                    ai = rec.get("aiTitle") or ai
+                    ai = text_of(rec.get("aiTitle")) or ai
                 elif t == "user" and not first and not rec.get("isMeta"):
                     c = rec.get("message", {}).get("content")
                     if isinstance(c, list):
                         c = next((x.get("text") for x in c if isinstance(x, dict)
                                   and x.get("type") == "text"), None)
                     if isinstance(c, str) and not c.startswith("<"):
-                        first = c
+                        first = text_of(c)
     except OSError:
         return "(untitled)"
-    return " ".join(printable(custom or ai or first or "(untitled)").split())[:70]
+    return (custom or ai or first or "(untitled)")[:70]
+
+
+def text_of(value):
+    """Transcript field as one printable line, or None if nothing is left."""
+    if value is None:
+        return None
+    return " ".join(printable(value).split()) or None
 
 
 def load(days, titles=True):
@@ -249,8 +275,9 @@ def load(days, titles=True):
             continue
         if not (isinstance(e, dict) and valid_sid(e.get("session_id"))
                 and p.stem == e["session_id"] and valid_cwd(e.get("cwd"))
-                and isinstance(e.get("pid"), int)
-                and isinstance(e.get("updated_at"), (int, float))):
+                and type(e.get("pid")) is int
+                and isinstance(e.get("started"), (str, type(None)))
+                and type(e.get("updated_at")) in (int, float)):
             p.unlink(missing_ok=True)  # not something this tool wrote
             continue
         tp = e.get("transcript_path")
@@ -259,22 +286,23 @@ def load(days, titles=True):
             continue
         if not tp or not os.path.exists(tp):
             # no message yet: drop it once the process is gone, nothing to resume
-            if not alive_claude(e["pid"]):
+            if not alive_claude(e["pid"], e.get("started")):
                 p.unlink(missing_ok=True)
             continue
         e["_path"], e["mtime"] = p, os.path.getmtime(tp)
         entries.append(e)
 
     # one process can hop sessions (/resume inside a session): keep its latest
-    by_pid = {}
+    by_proc = {}
     for e in sorted(entries, key=lambda e: e["updated_at"]):
-        if e["pid"] in by_pid:
-            by_pid[e["pid"]]["_path"].unlink(missing_ok=True)
-        by_pid[e["pid"]] = e
+        key = (e["pid"], e.get("started"))
+        if key in by_proc:
+            by_proc[key]["_path"].unlink(missing_ok=True)
+        by_proc[key] = e
 
     cutoff = time.time() - days * 86400
-    out = [e for e in by_pid.values()
-           if e["mtime"] >= cutoff and not alive_claude(e["pid"])]
+    out = [e for e in by_proc.values()
+           if e["mtime"] >= cutoff and not alive_claude(e["pid"], e.get("started"))]
     for e in out if titles else ():
         e["title"] = title_of(e["transcript_path"])
     return sorted(out, key=lambda e: e["mtime"], reverse=True)
